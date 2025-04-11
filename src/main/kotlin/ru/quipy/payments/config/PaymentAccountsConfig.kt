@@ -3,11 +3,7 @@ package ru.quipy.payments.config
 import com.fasterxml.jackson.databind.ObjectMapper
 import com.fasterxml.jackson.datatype.jsr310.JavaTimeModule
 import com.fasterxml.jackson.module.kotlin.registerKotlinModule
-import org.eclipse.jetty.http2.server.HTTP2CServerConnectionFactory
 import org.springframework.beans.factory.annotation.Value
-import org.springframework.boot.web.embedded.jetty.JettyServerCustomizer
-import org.springframework.boot.web.embedded.jetty.JettyServletWebServerFactory
-import org.springframework.boot.web.embedded.tomcat.TomcatConnectorCustomizer
 import org.springframework.context.annotation.Bean
 import org.springframework.context.annotation.Configuration
 import ru.quipy.core.EventSourcingService
@@ -32,10 +28,10 @@ class PaymentAccountsConfig {
 
     //private val allowedAccounts = setOf("acc-3") //case-1
     //private val allowedAccounts = setOf("acc-5") //case-2 case-3
-    //private val allowedAccounts = setOf("acc-8") //case-4
+    // private val allowedAccounts = setOf("acc-8") //case-4
     //private val allowedAccounts = setOf("acc-7") //case-5
-    //private val allowedAccounts = setOf("acc-16") //case-5.2
-    private val allowedAccounts = setOf("acc-9") //case-6
+    private val allowedAccounts = setOf("acc-16")//case-5.2
+    //private val allowedAccounts = setOf("acc-9") //case-6
 
 
     @Bean
