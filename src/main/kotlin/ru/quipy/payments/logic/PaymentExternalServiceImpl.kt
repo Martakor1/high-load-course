@@ -2,18 +2,21 @@ package ru.quipy.payments.logic
 
 import com.fasterxml.jackson.databind.ObjectMapper
 import com.fasterxml.jackson.module.kotlin.registerKotlinModule
-import okhttp3.OkHttpClient
-import okhttp3.Request
-import okhttp3.RequestBody
+import okhttp3.*
 import org.slf4j.LoggerFactory
 import ru.quipy.common.utils.FixedWindowRateLimiter
 import ru.quipy.core.EventSourcingService
 import ru.quipy.payments.api.PaymentAggregate
+import java.io.IOException
 import java.net.SocketTimeoutException
 import java.time.Duration
 import java.util.*
-import java.util.concurrent.Semaphore
 import java.util.concurrent.TimeUnit
+import java.net.URI
+import java.net.http.HttpClient
+import java.net.http.HttpRequest
+import java.net.http.HttpResponse
+import java.util.concurrent.Executors
 
 // Advice: always treat time as a Duration
 class PaymentExternalSystemAdapterImpl(
@@ -33,21 +36,34 @@ class PaymentExternalSystemAdapterImpl(
     private val requestAverageProcessingTime = properties.averageProcessingTime
     private val rateLimitPerSec = properties.rateLimitPerSec
     private val parallelRequests = properties.parallelRequests
+
     //case-5
     //private val OK_HTTP_CLIENT_TIMEOUT = requestAverageProcessingTime.multipliedBy(2) //just because (excel)
     //parallelRequests / rateLimitPerSec.toLong()
-    private val OK_HTTP_CLIENT_TIMEOUT = Duration.ofSeconds(1) //case-6 5win/5rps
+    //private val OK_HTTP_CLIENT_TIMEOUT = Duration.ofSeconds(1) //case-6 5win/5rps
+    private val OK_HTTP_CLIENT_TIMEOUT =
+        Duration.ofSeconds(20) //case-7 20000win/1000rps=20s (исчерпаем все окна за 20s и выйдем на оборот при том же avgTime=20)
 
-    private val client = OkHttpClient.Builder() //default timeout = 10s!
-        .callTimeout(OK_HTTP_CLIENT_TIMEOUT) //full call to serv, write + read
-        .readTimeout(OK_HTTP_CLIENT_TIMEOUT) //only between reed packages
-        .writeTimeout(OK_HTTP_CLIENT_TIMEOUT) //only between packages to write (send)
-        .connectTimeout(OK_HTTP_CLIENT_TIMEOUT) //only for establishing connection
+//    private val client = OkHttpClient.Builder() //default timeout = 10s!
+//        .callTimeout(OK_HTTP_CLIENT_TIMEOUT) //full call to serv, write + read
+//        .readTimeout(OK_HTTP_CLIENT_TIMEOUT) //only between reed packages in tcp buffer
+//        .writeTimeout(OK_HTTP_CLIENT_TIMEOUT) //only between packages to write (send) in tcp buffer
+//        .connectTimeout(OK_HTTP_CLIENT_TIMEOUT) //only for establishing connection
+//        .connectionPool(ConnectionPool(properties.parallelRequests, 10, TimeUnit.SECONDS))
+//        .protocols(Collections.singletonList(Protocol.H2_PRIOR_KNOWLEDGE)) //HTTP2 enable
+//        .build()
+
+    private val client = HttpClient.newBuilder() //case-7
+        .executor(Executors.newFixedThreadPool(20))
+        .version(HttpClient.Version.HTTP_2)
+        .connectTimeout(OK_HTTP_CLIENT_TIMEOUT)
         .build()
+
     //case 1-2
-        private val rpsLimiter = FixedWindowRateLimiter(rateLimitPerSec, 1, TimeUnit.SECONDS)
-//     private val parallelRequestSemaphore = Semaphore(parallelRequests)
-     //case 3
+    private val rpsLimiter = FixedWindowRateLimiter(rateLimitPerSec, 1, TimeUnit.SECONDS)
+
+    //     private val parallelRequestSemaphore = Semaphore(parallelRequests)
+    //case 3
 //    private val rpsLimiter = LeakingBucketRateLimiter(
 //        rateLimitPerSec,
 //        Duration.ofSeconds(1),
@@ -62,8 +78,8 @@ class PaymentExternalSystemAdapterImpl(
     override fun performPaymentAsync(paymentId: UUID, amount: Int, paymentStartedAt: Long, deadline: Long) {
         logger.warn("[$accountName] Submitting payment request for payment $paymentId")
 
-        val transactionId = UUID.randomUUID()
-        if (deadline - now() < statsService.getPercentile95()) {
+        val transactionId = UUID.randomUUID() //statsService.getPercentile95()
+        if (deadline - now() < 0) {
             requestCSVService.addRequestData(0, 0, paymentId, transactionId)
             paymentESService.update(paymentId) {
                 it.logProcessing(false, now(), transactionId, reason = "Request timeout.")
@@ -78,17 +94,17 @@ class PaymentExternalSystemAdapterImpl(
         paymentESService.update(paymentId) {
             it.logSubmission(success = true, transactionId, now(), Duration.ofMillis(now() - paymentStartedAt))
         }
-             // (blocking) case-2, 5req on semaphore / 5 procTime = 1rps
+        // (blocking) case-2, 5req on semaphore / 5 procTime = 1rps
 
 //        parallelRequestSemaphore.acquire()
 //        logger.info("Acquire. Semaphore queue length: ${parallelRequestSemaphore.queueLength}")
         rpsLimiter.tickBlocking()
 
         val timeout = OK_HTTP_CLIENT_TIMEOUT
-        val request = Request.Builder().run {
-            url("http://localhost:1234/external/process?serviceName=${serviceName}&accountName=${accountName}&transactionId=$transactionId&paymentId=$paymentId&amount=$amount&timeout=${timeout}")
-            post(emptyBody)
-        }.build()
+        val request = HttpRequest.newBuilder()
+            .uri(URI("http://localhost:1234/external/process?serviceName=${serviceName}&accountName=${accountName}&transactionId=$transactionId&paymentId=$paymentId&amount=$amount&timeout=${timeout}"))
+            .POST(HttpRequest.BodyPublishers.noBody())
+            .build()
 
         // case-3 практика показывает, что parallel совсем чуть-чуть ломается, если оставить только лимитер, без paralSemaphore
 //        if (!rpsLimiter.tick()) {
@@ -100,46 +116,51 @@ class PaymentExternalSystemAdapterImpl(
 //            return
 //        }
         val createdAt = now();
-        try {
-            client.newCall(request).execute().use { response ->
-                val body = try {
-                    mapper.readValue(response.body?.string(), ExternalSysResponse::class.java)
-                } catch (e: Exception) {
-                    logger.error("[$accountName] [ERROR] Payment processed for txId: $transactionId, payment: $paymentId, result code: ${response.code}, reason: ${response.body?.string()}")
-                    ExternalSysResponse(transactionId.toString(), paymentId.toString(),false, e.message)
-                }
+        client.sendAsync(request, HttpResponse.BodyHandlers.ofString()).thenApply { response ->
 
-                val callTime = now() - createdAt
-                statsService.addTime(callTime)
-                requestCSVService.addRequestData(callTime, response.code, paymentId, transactionId)
+            val body = try {
+                mapper.readValue(response.body(), ExternalSysResponse::class.java)
+            } catch (e: Exception) {
+                logger.error("[$accountName] [ERROR] Payment processed for txId: $transactionId, payment: $paymentId, result code: ${response.statusCode()}, reason: ${response.body()}")
+                ExternalSysResponse(transactionId.toString(), paymentId.toString(), false, e.message)
+            }
 
-                logger.warn("[$accountName] Payment processed for txId: $transactionId, payment: $paymentId, succeeded: ${body.result}, message: ${body.message}")
+            val callTime = now() - createdAt
+            statsService.addTime(callTime)
+            requestCSVService.addRequestData(callTime, response.statusCode(), paymentId, transactionId)
 
-                // Здесь мы обновляем состояние оплаты в зависимости от результата в базе данных оплат.
-                // Это требуется сделать ВО ВСЕХ ИСХОДАХ (успешная оплата / неуспешная / ошибочная ситуация)
-                paymentESService.update(paymentId) {
-                    it.logProcessing(body.result, now(), transactionId, reason = body.message)
-                }
+            logger.warn("[$accountName] Payment processed for txId: $transactionId, payment: $paymentId, succeeded: ${body.result}, message: ${body.message}")
+
+            // Здесь мы обновляем состояние оплаты в зависимости от результата в базе данных оплат.
+            // Это требуется сделать ВО ВСЕХ ИСХОДАХ (успешная оплата / неуспешная / ошибочная ситуация)
+            paymentESService.update(paymentId) {
+                it.logProcessing(body.result, now(), transactionId, reason = body.message)
+            }
 
 //                parallelRequestSemaphore.release()
 //                logger.info("Release. Semaphore queue length: ${parallelRequestSemaphore.queueLength}")
-                if (!body.result) {
-                    performPaymentAsync(paymentId, amount, paymentStartedAt, deadline)
-                }
+            if (!body.result) {
+                performPaymentAsync(paymentId, amount, paymentStartedAt, deadline)
             }
-        } catch (e: Exception) {
+        }.exceptionally { e ->
             logger.info("Catch exception ${e.message}")
             requestCSVService.addRequestData(now() - createdAt, 0, paymentId, transactionId)
             when (e) {
                 is SocketTimeoutException -> {
-                    logger.error("[$accountName] Payment timeout for txId: $transactionId, payment: $paymentId", e)
+                    logger.error(
+                        "[$accountName] Payment timeout for txId: $transactionId, payment: $paymentId",
+                        e
+                    )
                     paymentESService.update(paymentId) {
                         it.logProcessing(false, now(), transactionId, reason = "Request timeout.")
                     }
                 }
 
                 else -> {
-                    logger.error("[$accountName] Payment failed for txId: $transactionId, payment: $paymentId", e)
+                    logger.error(
+                        "[$accountName] Payment failed for txId: $transactionId, payment: $paymentId",
+                        e
+                    )
 
                     paymentESService.update(paymentId) {
                         it.logProcessing(false, now(), transactionId, reason = e.message)
@@ -150,6 +171,7 @@ class PaymentExternalSystemAdapterImpl(
 //            logger.info("Release in catch. Semaphore queue length: ${parallelRequestSemaphore.queueLength}")
             performPaymentAsync(paymentId, amount, paymentStartedAt, deadline)
         }
+
     }
 
     override fun price() = properties.price

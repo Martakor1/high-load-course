@@ -13,7 +13,7 @@ class RequestCSVService {
     @Synchronized
     fun addRequestData(responseTime: Long, httpCode: Int, paymentId: UUID, transactionId: UUID) {
         requestDataList.add(RequestData(responseTime, httpCode, paymentId, transactionId))
-        if (requestDataList.size % 50 == 0 || requestDataList.size == 2) {
+        if (requestDataList.size % 1000 == 0 || requestDataList.size == 2) {
             saveToCsv("request_stats_" + requestDataList.size + ".csv")
         }
     }
