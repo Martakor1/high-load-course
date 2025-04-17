@@ -38,7 +38,7 @@ class PaymentExternalSystemAdapterImpl(
     //parallelRequests / rateLimitPerSec.toLong()
     private val OK_HTTP_CLIENT_TIMEOUT = Duration.ofSeconds(1) //case-6 5win/5rps
 
-    private val client = OkHttpClient.Builder()
+    private val client = OkHttpClient.Builder() //default timeout = 10s!
         .callTimeout(OK_HTTP_CLIENT_TIMEOUT) //full call to serv, write + read
         .readTimeout(OK_HTTP_CLIENT_TIMEOUT) //only between reed packages
         .writeTimeout(OK_HTTP_CLIENT_TIMEOUT) //only between packages to write (send)
@@ -64,6 +64,7 @@ class PaymentExternalSystemAdapterImpl(
 
         val transactionId = UUID.randomUUID()
         if (deadline - now() < statsService.getPercentile95()) {
+            requestCSVService.addRequestData(0, 0, paymentId, transactionId)
             paymentESService.update(paymentId) {
                 it.logProcessing(false, now(), transactionId, reason = "Request timeout.")
             }
@@ -77,17 +78,17 @@ class PaymentExternalSystemAdapterImpl(
         paymentESService.update(paymentId) {
             it.logSubmission(success = true, transactionId, now(), Duration.ofMillis(now() - paymentStartedAt))
         }
-
-        val request = Request.Builder().run {
-            url("http://localhost:1234/external/process?serviceName=${serviceName}&accountName=${accountName}&transactionId=$transactionId&paymentId=$paymentId&amount=$amount")
-            post(emptyBody)
-        }.build()
-
              // (blocking) case-2, 5req on semaphore / 5 procTime = 1rps
 
 //        parallelRequestSemaphore.acquire()
 //        logger.info("Acquire. Semaphore queue length: ${parallelRequestSemaphore.queueLength}")
         rpsLimiter.tickBlocking()
+
+        val timeout = OK_HTTP_CLIENT_TIMEOUT
+        val request = Request.Builder().run {
+            url("http://localhost:1234/external/process?serviceName=${serviceName}&accountName=${accountName}&transactionId=$transactionId&paymentId=$paymentId&amount=$amount&timeout=${timeout}")
+            post(emptyBody)
+        }.build()
 
         // case-3 практика показывает, что parallel совсем чуть-чуть ломается, если оставить только лимитер, без paralSemaphore
 //        if (!rpsLimiter.tick()) {
@@ -98,9 +99,8 @@ class PaymentExternalSystemAdapterImpl(
 //            parallelRequestSemaphore.release()
 //            return
 //        }
-
+        val createdAt = now();
         try {
-            val createdAt = now();
             client.newCall(request).execute().use { response ->
                 val body = try {
                     mapper.readValue(response.body?.string(), ExternalSysResponse::class.java)
@@ -129,6 +129,7 @@ class PaymentExternalSystemAdapterImpl(
             }
         } catch (e: Exception) {
             logger.info("Catch exception ${e.message}")
+            requestCSVService.addRequestData(now() - createdAt, 0, paymentId, transactionId)
             when (e) {
                 is SocketTimeoutException -> {
                     logger.error("[$accountName] Payment timeout for txId: $transactionId, payment: $paymentId", e)
