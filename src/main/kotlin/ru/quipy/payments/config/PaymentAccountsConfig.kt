@@ -3,7 +3,10 @@ package ru.quipy.payments.config
 import com.fasterxml.jackson.databind.ObjectMapper
 import com.fasterxml.jackson.datatype.jsr310.JavaTimeModule
 import com.fasterxml.jackson.module.kotlin.registerKotlinModule
+import org.eclipse.jetty.http2.server.HTTP2CServerConnectionFactory
 import org.springframework.beans.factory.annotation.Value
+import org.springframework.boot.web.embedded.jetty.JettyServerCustomizer
+import org.springframework.boot.web.embedded.jetty.JettyServletWebServerFactory
 import org.springframework.context.annotation.Bean
 import org.springframework.context.annotation.Configuration
 import ru.quipy.core.EventSourcingService
@@ -30,8 +33,9 @@ class PaymentAccountsConfig {
     //private val allowedAccounts = setOf("acc-5") //case-2 case-3
     // private val allowedAccounts = setOf("acc-8") //case-4
     //private val allowedAccounts = setOf("acc-7") //case-5
-    private val allowedAccounts = setOf("acc-16")//case-5.2
+    //private val allowedAccounts = setOf("acc-16")//case-5.2
     //private val allowedAccounts = setOf("acc-9") //case-6
+    private val allowedAccounts = setOf("acc-12")
 
 
     @Bean
@@ -52,5 +56,17 @@ class PaymentAccountsConfig {
                 it.accountName in allowedAccounts
             }.onEach(::println)
             .map { PaymentExternalSystemAdapterImpl(it, paymentService) }
+    }
+
+    @Bean // это для Jetty
+    fun jettyServerCustomizer(): JettyServletWebServerFactory {
+        val jettyServletWebServerFactory = JettyServletWebServerFactory()
+
+        val c = JettyServerCustomizer {
+            (it.connectors[0].getConnectionFactory("h2c") as HTTP2CServerConnectionFactory).maxConcurrentStreams = 1_000_000
+        }
+
+        jettyServletWebServerFactory.serverCustomizers.add(c)
+        return jettyServletWebServerFactory
     }
 }
